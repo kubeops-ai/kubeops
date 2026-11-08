@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kubeops-demo
+  labels:
+    app: kubeops-demo
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: kubeops-demo
+  template:
+    metadata:
+      labels:
+        app: kubeops-demo
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.27-alpine
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 80
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kubeops-demo
+  labels:
+    app: kubeops-demo
+spec:
+  selector:
+    app: kubeops-demo
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+  type: ClusterIP
