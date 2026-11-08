@@ -8,7 +8,7 @@ from langchain_openai import ChatOpenAI
 from supervisor_agent import run_supervisor_agent
 
 # Edit this question before running the script.
-QUESTION = "The Troubleshooting Agent wants to use the admin kubeconfig for a read-only pod diagnosis.?"
+QUESTION = "show me all the deployments and services"
 logger = logging.getLogger("kubeops")
 
 

@@ -1,191 +1,116 @@
+"""Insight Agent that discovers its tools from the KubeOps MCP server."""
+
+import asyncio
+import json
 import logging
-from pathlib import Path
+import os
+from typing import Any, Optional
 
-from kubernetes import client
-from langchain_core.tools import tool
+from langchain_core.tools import StructuredTool
+from mcp import Client
+from pydantic import create_model
 
-from agent_workflow import open_kubernetes_client, run_read_only_agent
+from agent_workflow import run_read_only_agent
 
 
-DEVELOPER_KUBECONFIG = Path.home() / ".kube" / "k8s-developer.conf"
 logger = logging.getLogger("kubeops.insight")
-MAX_POD_EVENTS = 10
 
 
-@tool
-def list_namespaces() -> list[str]:
-    """List the names of all namespaces in the live Kubernetes cluster."""
-    with open_kubernetes_client(DEVELOPER_KUBECONFIG) as api_client:
-        api = client.CoreV1Api(api_client)
-        logger.info("Kubernetes SDK: list namespaces.")
-        namespaces = api.list_namespace(_request_timeout=10)
-        return sorted(namespace.metadata.name for namespace in namespaces.items)
+def _server_url() -> str:
+    """Read the MCP URL when it is needed, after .env has been loaded."""
+    return os.getenv("KUBEOPS_MCP_URL", "http://127.0.0.1:8000/mcp")
 
 
-@tool
-def list_pods(namespace: str = "default") -> list[str]:
-    """List all pod names in one namespace. If omitted, use the default namespace."""
-    namespace = namespace.strip() or "default"
-    with open_kubernetes_client(DEVELOPER_KUBECONFIG) as api_client:
-        api = client.CoreV1Api(api_client)
-        logger.info("Kubernetes SDK: list pods in namespace %s.", namespace)
-        pods = api.list_namespaced_pod(namespace=namespace, _request_timeout=10)
-        return sorted(pod.metadata.name for pod in pods.items)
+def _python_type(schema: dict[str, Any]) -> type:
+    """Convert common JSON Schema types into simple Python types."""
+    schema_type = schema.get("type", "string")
+    return {
+        "string": str,
+        "integer": int,
+        "number": float,
+        "boolean": bool,
+        "array": list,
+        "object": dict,
+    }.get(schema_type, str)
 
 
-@tool
-def list_deployments(namespace: str = "default") -> list[str]:
-    """List all deployment names in one namespace. If omitted, use default."""
-    namespace = namespace.strip() or "default"
-    with open_kubernetes_client(DEVELOPER_KUBECONFIG) as api_client:
-        api = client.AppsV1Api(api_client)
-        logger.info("Kubernetes SDK: list deployments in namespace %s.", namespace)
-        deployments = api.list_namespaced_deployment(
-            namespace=namespace, _request_timeout=10
-        )
-        return sorted(deployment.metadata.name for deployment in deployments.items)
+async def _discover_mcp_tools() -> list[Any]:
+    async with Client(_server_url()) as mcp_client:
+        result = await mcp_client.list_tools()
+    return result.tools
 
 
-@tool
-def list_services(namespace: str = "default") -> list[str]:
-    """List all service names in one namespace. If omitted, use default."""
-    namespace = namespace.strip() or "default"
-    with open_kubernetes_client(DEVELOPER_KUBECONFIG) as api_client:
-        api = client.CoreV1Api(api_client)
-        logger.info("Kubernetes SDK: list services in namespace %s.", namespace)
-        services = api.list_namespaced_service(
-            namespace=namespace, _request_timeout=10
-        )
-        return sorted(service.metadata.name for service in services.items)
+async def _call_mcp_tool(tool_name: str, arguments: dict[str, Any]) -> list[str]:
+    async with Client(_server_url()) as mcp_client:
+        result = await mcp_client.call_tool(tool_name, arguments)
+
+    if result.is_error:
+        raise RuntimeError(f"MCP tool failed: {tool_name}")
+
+    if result.structured_content and "result" in result.structured_content:
+        return result.structured_content["result"]
+
+    for content in result.content:
+        if getattr(content, "text", None):
+            value = json.loads(content.text)
+            return value if isinstance(value, list) else [str(value)]
+    return []
 
 
-@tool
-def list_nodes() -> list[str]:
-    """List cluster nodes with readiness, roles, internal IP, and kubelet version."""
-    with open_kubernetes_client(DEVELOPER_KUBECONFIG) as api_client:
-        api = client.CoreV1Api(api_client)
-        logger.info("Kubernetes SDK: list cluster nodes.")
-        nodes = api.list_node(_request_timeout=10)
+def _make_langchain_tool(mcp_tool: Any) -> StructuredTool:
+    """Create a LangChain tool from one MCP tool description."""
+    # MCP SDK versions use either snake_case or camelCase for this field.
+    schema = getattr(mcp_tool, "input_schema", None)
+    if schema is None:
+        schema = getattr(mcp_tool, "inputSchema", None)
+    schema = schema or {}
+    properties = schema.get("properties", {})
+    required = set(schema.get("required", []))
+    fields = {}
 
-    details = []
-    role_prefix = "node-role.kubernetes.io/"
-    for node in sorted(nodes.items, key=lambda node: node.metadata.name):
-        status = node.status or client.V1NodeStatus()
-        # Kubernetes reports readiness as a condition on each node.
-        ready = next(
-            (condition.status for condition in status.conditions or []
-             if condition.type == "Ready"),
-            "Unknown",
-        )
-        readiness = {"True": "Ready", "False": "NotReady"}.get(ready, "Unknown")
-        roles = sorted(
-            label.removeprefix(role_prefix)
-            for label in (node.metadata.labels or {})
-            if label.startswith(role_prefix)
-        )
-        internal_ip = next(
-            (address.address for address in status.addresses or []
-             if address.type == "InternalIP"),
-            "Unknown",
-        )
-        version = status.node_info.kubelet_version if status.node_info else "Unknown"
-        details.append(
-            f"{node.metadata.name} | {readiness} | Roles: {', '.join(roles) or 'None'}"
-            f" | Internal IP: {internal_ip} | Kubelet: {version}"
-        )
-    return details
+    for name, property_schema in properties.items():
+        value_type = _python_type(property_schema)
+        default = property_schema.get("default", ... if name in required else None)
+        if name not in required:
+            value_type = Optional[value_type]
+        fields[name] = (value_type, default)
 
+    arguments_model = create_model(f"{mcp_tool.name.title()}Arguments", **fields)
 
-@tool
-def get_pod_logs(
-    pod_name: str,
-    namespace: str = "default",
-    container: str = "",
-    tail_lines: int = 100,
-) -> list[str]:
-    """Get recent logs from a pod. If omitted, use the default namespace."""
-    namespace = namespace.strip() or "default"
-    tail_lines = max(1, min(tail_lines, 500))
-    with open_kubernetes_client(DEVELOPER_KUBECONFIG) as api_client:
-        api = client.CoreV1Api(api_client)
-        logger.info("Kubernetes SDK: get logs for pod %s in namespace %s.", pod_name, namespace)
-        log_text = api.read_namespaced_pod_log(
-            name=pod_name,
-            namespace=namespace,
-            container=container.strip() or None,
-            tail_lines=tail_lines,
-            timestamps=True,
-            _request_timeout=10,
-        )
+    def call_discovered_tool(**arguments):
+        logger.info("Calling discovered MCP tool %s.", mcp_tool.name)
+        return asyncio.run(_call_mcp_tool(mcp_tool.name, arguments))
 
-    if not log_text.strip():
-        return ["No log lines found."]
-    return log_text.splitlines()
-
-
-@tool
-def get_pod_events(pod_name: str, namespace: str = "default") -> list[str]:
-    """Get recent Kubernetes events for a named pod."""
-    namespace = namespace.strip() or "default"
-    with open_kubernetes_client(DEVELOPER_KUBECONFIG) as api_client:
-        api = client.CoreV1Api(api_client)
-        logger.info("Kubernetes SDK: get events for pod %s in namespace %s.", pod_name, namespace)
-        pod = api.read_namespaced_pod(
-            name=pod_name, namespace=namespace, _request_timeout=10
-        )
-        events = api.list_namespaced_event(
-            namespace=namespace,
-            field_selector=f"involvedObject.uid={pod.metadata.uid}",
-            _request_timeout=10,
-        )
-
-    recent_events = sorted(
-        events.items,
-        key=lambda event: str(
-            event.last_timestamp
-            or event.event_time
-            or event.metadata.creation_timestamp
-        ),
-        reverse=True,
-    )[:MAX_POD_EVENTS]
-    if not recent_events:
-        return ["No events found."]
-
-    return [
-        f"{event.type or 'Unknown'} ({event.reason or 'Unknown'}): "
-        f"{event.message or 'No message'}"
-        for event in recent_events
-    ]
+    return StructuredTool.from_function(
+        func=call_discovered_tool,
+        name=mcp_tool.name,
+        description=mcp_tool.description or f"Call MCP tool {mcp_tool.name}.",
+        args_schema=arguments_model,
+    )
 
 
 def run_insight_agent(model, question: str) -> str:
-    tools = [
-        list_namespaces,
-        list_pods,
-        list_deployments,
-        list_services,
-        list_nodes,
-        get_pod_logs,
-        get_pod_events,
+    """Discover MCP tools and let LangGraph use the discovered tool schemas."""
+    discovered_tools = asyncio.run(_discover_mcp_tools())
+    # Insight must not receive admin-only troubleshooting tools.
+    mcp_tools = [
+        mcp_tool
+        for mcp_tool in discovered_tools
+        if mcp_tool.name != "ping" and not mcp_tool.name.startswith("diagnose_")
     ]
-    headings = {
-        "list_namespaces": "Namespaces:",
-        "list_pods": "Pods:",
-        "list_deployments": "Deployments:",
-        "list_services": "Services:",
-        "list_nodes": "Nodes:",
-        "get_pod_logs": "Pod logs:",
-        "get_pod_events": "Pod events:",
-    }
+    tools = [_make_langchain_tool(mcp_tool) for mcp_tool in mcp_tools]
+    headings = {tool.name: f"{tool.name.replace('_', ' ').title()}:" for tool in tools}
+    logger.info("Discovered MCP tools: %s", ", ".join(tool.name for tool in tools))
+
     instructions = (
         "You are the KubeOps Insight Agent for read-only cluster lookups. "
-        "Use the matching tool for live cluster data. "
+        "Use the discovered MCP tool that matches the user's request. "
         "If the tools cannot retrieve the requested data, explain that limitation. "
         "Decline requests to change the cluster. Never invent live results. "
-        "Use list_nodes for cluster node details. "
-        "Use get_pod_logs when the user asks for logs from a named pod. "
-        "Use get_pod_events when the user asks for events from a named pod. "
-        "If the user does not name a namespace, leave the namespace argument out. "
+        "For namespace-scoped tools, an omitted namespace always means the default "
+        "namespace. For example, 'list all pods' means list pods in default. "
+        "Do not call list_namespaces first unless the user asks for namespaces or "
+        "explicitly asks for resources across every namespace. "
         "Use every tool needed to answer all parts of the question. "
         "After using tools, give a brief summary of what they found."
     )

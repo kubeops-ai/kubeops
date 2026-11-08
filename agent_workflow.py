@@ -154,7 +154,7 @@ def run_tool(tool_call, tools_by_name, headings):
         raise SystemExit(f"Kubernetes request failed (HTTP {error.status}).") from None
 
     logger.info("Tool returned %d result(s). Printing the output.", len(results))
-    print(headings[selected_tool.name], flush=True)
+    print(headings.get(selected_tool.name, f"{selected_tool.name}:"), flush=True)
 
     if not results:
         print("No results found.", flush=True)
