@@ -4,11 +4,10 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
-
 from supervisor_agent import run_supervisor_agent
 
 # Edit this question before running the script.
-QUESTION = "show me all the deployments and services"
+QUESTION = "list out all the namesapces in the cluster"
 logger = logging.getLogger("kubeops")
 
 
@@ -22,7 +21,6 @@ def main():
     if not api_key:
         raise SystemExit("Set OPENAI_API_KEY in the .env file next to ask_model.py.")
 
-    # Luna supports function tools with reasoning through the Responses API.
     model = ChatOpenAI(
         model="gpt-5.6-luna", api_key=api_key, use_responses_api=True
     )

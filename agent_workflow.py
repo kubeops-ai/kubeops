@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 from uuid import uuid4
 from pathlib import Path
 
@@ -12,8 +13,50 @@ from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.types import Command, interrupt
 
 
-MAX_MODEL_CALLS = 6
+MAX_MODEL_CALLS = 10
 logger = logging.getLogger("kubeops.workflow")
+_postgres_checkpointer = None
+_postgres_context = None
+
+
+class HumanApprovalRequired(Exception):
+    """Raised so a web caller can display the HITL decision in its UI."""
+
+    def __init__(self, graph, state, config, message):
+        super().__init__(message)
+        self.graph = graph
+        self.state = state
+        self.config = config
+        self.message = message
+
+
+def get_checkpointer():
+    """Use PostgreSQL for history when KUBEOPS_POSTGRES_URL is configured."""
+    global _postgres_checkpointer, _postgres_context
+    database_url = os.getenv("KUBEOPS_POSTGRES_URL", "").strip()
+    if not database_url:
+        logger.warning("KUBEOPS_POSTGRES_URL is not set; using memory history.")
+        return MemorySaver()
+    if _postgres_checkpointer is None:
+        try:
+            from langgraph.checkpoint.postgres import PostgresSaver
+        except ImportError as error:
+            raise RuntimeError(
+                "Install langgraph-checkpoint-postgres to use PostgreSQL history."
+            ) from error
+        _postgres_context = PostgresSaver.from_conn_string(database_url)
+        _postgres_checkpointer = _postgres_context.__enter__()
+        _postgres_checkpointer.setup()
+        logger.info("PostgreSQL checkpointer is ready.")
+    return _postgres_checkpointer
+
+
+def delete_chat_history(chat_id: str):
+    """Delete one chat's checkpoints from PostgreSQL."""
+    checkpointer = get_checkpointer()
+    delete_thread = getattr(checkpointer, "delete_thread", None)
+    if delete_thread:
+        delete_thread(chat_id)
 
 
 class RequestState(MessagesState):
@@ -34,7 +77,9 @@ def open_kubernetes_client(kubeconfig: Path):
 
 
 def run_read_only_agent(
-    model, question, instructions, tools, headings, require_human_approval=False
+    model, question, instructions, tools, headings, require_human_approval=False,
+    chat_id=None,
+    interactive_approval=True,
 ):
     # Each agent supplies its own prompt and allowed tools.
     tools_by_name = {registered_tool.name: registered_tool for registered_tool in tools}
@@ -48,13 +93,22 @@ def run_read_only_agent(
         tools_by_name,
         headings,
         require_human_approval=require_human_approval,
+        checkpointer=get_checkpointer(),
     )
-    config = {"configurable": {"thread_id": uuid4().hex}}
+    # Use a fresh checkpoint thread for each question turn. Reusing one thread
+    # after a failed tool call can make the model resume an incomplete exchange.
+    # The application chat_id still groups all turns in PostgreSQL.
+    thread_id = f"{chat_id}:{uuid4().hex}" if chat_id else uuid4().hex
+    config = {"configurable": {"thread_id": thread_id}}
     state = graph.invoke({"messages": messages, "model_calls": 0}, config)
 
     # A Troubleshooting request pauses here until a human approves the admin read.
     while "__interrupt__" in state:
         request = state["__interrupt__"][0].value
+        if not interactive_approval:
+            raise HumanApprovalRequired(
+                graph, state, config, request["message"]
+            )
         print(request["message"], flush=True)
         decision = input("Approve? Type yes or no: ").strip().lower()
         state = graph.invoke(Command(resume=decision), config)
@@ -63,12 +117,24 @@ def run_read_only_agent(
 
 
 def build_request_graph(
-    model_with_tools, tools_by_name, headings, require_human_approval=False
+    model_with_tools, tools_by_name, headings, require_human_approval=False,
+    checkpointer=None,
 ):
     def call_model(state: RequestState):
         call_number = state["model_calls"] + 1
         if call_number > MAX_MODEL_CALLS:
-            raise SystemExit("Stopped after reaching the model call limit.")
+            logger.warning("Stopped after reaching the model call limit.")
+            return {
+                "messages": [
+                    AIMessage(
+                        content=(
+                            "The investigation reached its tool-call limit. "
+                            "Please use the evidence already collected."
+                        )
+                    )
+                ],
+                "model_calls": call_number,
+            }
 
         logger.info("LangGraph model step (%d/%d).", call_number, MAX_MODEL_CALLS)
         response = model_with_tools.invoke(state["messages"])
@@ -77,17 +143,27 @@ def build_request_graph(
     def choose_next_step(state: RequestState):
         # Route to the tools if the model requests a call. Otherwise finish.
         if state["messages"][-1].tool_calls:
-            if require_human_approval:
+            requested_tools = state["messages"][-1].tool_calls
+            needs_approval = any(
+                call["name"].startswith("troubleshoot_")
+                for call in requested_tools
+            )
+            if require_human_approval and needs_approval:
                 return "approval"
             return "tools"
         return END
 
     def request_human_approval(state: RequestState):
+        requested_tools = state["messages"][-1].tool_calls
+        tool_details = "\n".join(
+            f"- {call['name']} with arguments: {call['args']}"
+            for call in requested_tools
+        )
         approval = interrupt(
             {
                 "message": (
-                    "The Troubleshooting Agent wants to use the admin kubeconfig "
-                    "for a read-only pod diagnosis."
+                    "The Troubleshooting Agent wants approval for these admin "
+                    "Kubernetes operation(s):\n" + tool_details
                 )
             }
         )
@@ -131,7 +207,7 @@ def build_request_graph(
     builder.add_conditional_edges("model", choose_next_step, ["approval", "tools", END])
     builder.add_conditional_edges("approval", choose_after_approval, ["tools", END])
     builder.add_edge("tools", "model")
-    return builder.compile(checkpointer=MemorySaver())
+    return builder.compile(checkpointer=checkpointer or MemorySaver())
 
 
 def run_tool(tool_call, tools_by_name, headings):
