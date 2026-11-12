@@ -28,3 +28,16 @@ Open `http://127.0.0.1:8200` in a browser. Questions submitted from the page
 use the same Supervisor, Insight, Troubleshooting, RAG, and MCP flow as
 `ask_model.py`.
 
+# Run the live pod-listing evaluation
+
+With the MCP server running:
+
+```powershell
+python .\eval_list_pods.py
+```
+
+This verifies that `list_pods` is discovered, receives `namespace="dev"`, and
+returns a list without changing the cluster. It also verifies that a direct
+destructive command such as `kubectl delete deployment` is blocked by the
+project guardrail.
+

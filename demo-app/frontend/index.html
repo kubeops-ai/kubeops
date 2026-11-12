@@ -1,0 +1,7 @@
+<!doctype html><html><head><title>KubeOps Notes</title></head><body>
+<h1>KubeOps Notes</h1><input id="note" placeholder="Enter a note"><button onclick="saveNote()">Save</button><button onclick="loadNotes()">Refresh</button><ul id="notes"></ul>
+<script>
+const api = "/api";
+async function saveNote(){const input=document.getElementById("note");if(!input.value.trim())return;await fetch(api+"/notes",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text:input.value})});input.value="";loadNotes();}
+async function loadNotes(){const response=await fetch(api+"/notes");const notes=await response.json();document.getElementById("notes").innerHTML=notes.map(note=>`<li>${note.text}</li>`).join("");} loadNotes();
+</script></body></html>

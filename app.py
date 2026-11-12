@@ -13,6 +13,7 @@ from pydantic import BaseModel
 from langchain_openai import ChatOpenAI
 from langgraph.types import Command
 from supervisor_agent import run_supervisor_agent
+from security_guardrails import check_request
 from agent_workflow import HumanApprovalRequired, delete_chat_history
 from chat_store import (
     add_message,
@@ -307,6 +308,12 @@ def ask_question(request: QuestionRequest):
     question = request.question.strip()
     if not question:
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
+
+    blocked_response = check_request(question)
+    if blocked_response:
+        add_message(request.chat_id, request.user_id, "human", question)
+        add_message(request.chat_id, request.user_id, "ai", blocked_response)
+        return AnswerResponse(answer=blocked_response)
 
     try:
         # Temporary direct mode: MCP, RAG, Supervisor, and agent tools are disabled.

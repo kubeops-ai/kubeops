@@ -5,6 +5,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from supervisor_agent import run_supervisor_agent
+from security_guardrails import check_request
 
 # Edit this question before running the script.
 QUESTION = "list out all the namesapces in the cluster"
@@ -20,6 +21,11 @@ def main():
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise SystemExit("Set OPENAI_API_KEY in the .env file next to ask_model.py.")
+
+    blocked_response = check_request(QUESTION)
+    if blocked_response:
+        print(blocked_response)
+        return
 
     model = ChatOpenAI(
         model="gpt-5.6-luna", api_key=api_key, use_responses_api=True

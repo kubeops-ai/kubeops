@@ -80,6 +80,7 @@ def run_read_only_agent(
     model, question, instructions, tools, headings, require_human_approval=False,
     chat_id=None,
     interactive_approval=True,
+    allow_mutations=False,
 ):
     # Each agent supplies its own prompt and allowed tools.
     tools_by_name = {registered_tool.name: registered_tool for registered_tool in tools}
@@ -94,6 +95,7 @@ def run_read_only_agent(
         headings,
         require_human_approval=require_human_approval,
         checkpointer=get_checkpointer(),
+        allow_mutations=allow_mutations,
     )
     # Use a fresh checkpoint thread for each question turn. Reusing one thread
     # after a failed tool call can make the model resume an incomplete exchange.
@@ -119,6 +121,7 @@ def run_read_only_agent(
 def build_request_graph(
     model_with_tools, tools_by_name, headings, require_human_approval=False,
     checkpointer=None,
+    allow_mutations=False,
 ):
     def call_model(state: RequestState):
         call_number = state["model_calls"] + 1
@@ -144,6 +147,11 @@ def build_request_graph(
         # Route to the tools if the model requests a call. Otherwise finish.
         if state["messages"][-1].tool_calls:
             requested_tools = state["messages"][-1].tool_calls
+            if any(
+                call["name"].startswith("troubleshoot_")
+                for call in requested_tools
+            ) and not allow_mutations:
+                return "blocked_mutation"
             needs_approval = any(
                 call["name"].startswith("troubleshoot_")
                 for call in requested_tools
@@ -184,6 +192,20 @@ def build_request_graph(
         logger.info("Human approved the Troubleshooting Agent tool call.")
         return {"approved": True}
 
+    def block_mutation(state: RequestState):
+        logger.warning("Blocked admin mutation because the user did not request a change.")
+        return {
+            "messages": [
+                AIMessage(
+                    content=(
+                        "I can inspect the Kubernetes resource, but I will not make "
+                        "a cluster change because the user did not explicitly request "
+                        "a fix or update."
+                    )
+                )
+            ]
+        }
+
     def choose_after_approval(state: RequestState):
         return "tools" if state.get("approved", False) else END
 
@@ -203,10 +225,14 @@ def build_request_graph(
     builder.add_node("model", call_model)
     builder.add_node("approval", request_human_approval)
     builder.add_node("tools", call_tools)
+    builder.add_node("blocked_mutation", block_mutation)
     builder.add_edge(START, "model")
-    builder.add_conditional_edges("model", choose_next_step, ["approval", "tools", END])
+    builder.add_conditional_edges(
+        "model", choose_next_step, ["approval", "tools", "blocked_mutation", END]
+    )
     builder.add_conditional_edges("approval", choose_after_approval, ["tools", END])
     builder.add_edge("tools", "model")
+    builder.add_edge("blocked_mutation", END)
     return builder.compile(checkpointer=checkpointer or MemorySaver())
 
 

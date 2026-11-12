@@ -11,7 +11,8 @@ logger = logging.getLogger("kubeops.troubleshooting")
 
 
 def run_troubleshooting_agent(
-    model, question: str, chat_id: str | None = None, interactive_approval=True
+    model, question: str, chat_id: str | None = None, interactive_approval=True,
+    allow_mutations=False,
 ) -> str:
     """Discover troubleshooting tools and run them with HITL approval."""
     mcp_tools = asyncio.run(_discover_mcp_tools())
@@ -61,4 +62,5 @@ def run_troubleshooting_agent(
         require_human_approval=True,
         chat_id=chat_id,
         interactive_approval=interactive_approval,
+        allow_mutations=allow_mutations,
     )
